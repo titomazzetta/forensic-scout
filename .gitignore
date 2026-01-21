@@ -1,0 +1,9 @@
+output/
+*.dd
+*.img
+*.e01
+*.E01
+*.aff
+*.raw
+.DS_Store
+Thumbs.db
