@@ -6,14 +6,14 @@
 # Purpose:
 #   - Coursework/rubric-friendly, portfolio-ready CLI workflow.
 #   - Static-only analysis (no execution of recovered artifacts).
-#   - Disk image mode (NTFS) via SleuthKit OR directory mode (no deleted recovery).
+#   - Image mode (NTFS) via SleuthKit OR directory mode (no deleted recovery).
+#   - Handles both partitioned images (mmls works) and volume images (mmls fails).
 #
-# Debian installs:
+# Debian/Kali installs:
 #   sudo apt install -y sleuthkit file binutils unzip
 # Optional (OFF by default):
 #   sudo apt install -y yara clamav
 # ==============================================================================
-
 set -euo pipefail
 
 BOLD="$(tput bold 2>/dev/null || true)"
@@ -27,12 +27,14 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 
 TARGET=""
 OUTROOT="./output"
+PROJECT_ROOT=""
 CASE_NAME="case"
-OFFSET_SECTORS=""            # SleuthKit sector offset
-RECOVER_MODE="interesting"    # interesting|all|none
+OFFSET_SECTORS=""             # SleuthKit sector offset (partitioned images)
+RECOVER_MODE="interesting"     # interesting|all|none
 MAX_RECOVER=200
 STR_CAP=4000000
 KEYWORDS_FILE=""
+MAKE_READONLY=0
 RUN_YARA=0; YARA_RULES=""
 RUN_CLAMAV=0
 
@@ -46,10 +48,11 @@ Usage:
   ./forensic_scout.sh --target <image_or_dir> [options]
 
 Core:
+  --project-root DIR       Create Unit5-style folders under DIR; default output -> DIR/notes
   --target PATH            Disk image file OR mounted/extracted directory (required)
   --out DIR                Output root directory (default: ./output)
   --case NAME              Case label used in output folder (default: case)
-  --offset SECTORS         Partition offset in sectors (image mode); auto-detect if omitted
+  --offset SECTORS         Partition offset in sectors (partitioned image mode); auto-detect if omitted
   --keywords FILE          IOC keyword list (one per line); built-in list if omitted
 
 Recovery (image mode):
@@ -59,6 +62,7 @@ Recovery (image mode):
   --max-recover N          Cap recovered deleted files (default: 200)
 
 Static analysis:
+  --make-readonly          chmod a-w on image target (image mode only)
   --strings-cap-bytes N    Cap strings output per file (default: 4000000)
   --yara RULES_DIR         Optional YARA scan (requires yara)
   --clamav                 Optional ClamAV scan (requires clamscan)
@@ -66,6 +70,7 @@ Static analysis:
 Examples:
   ./forensic_scout.sh --target evidence.dd --case unit5
   ./forensic_scout.sh --target evidence.dd --offset 2048 --case unit5
+  ./forensic_scout.sh --project-root ~/Documents/Unit5_Project_V2 --target ~/Documents/Unit5_Project_V2/evidence/fullstack_lab.img --case unit5 --make-readonly
   ./forensic_scout.sh --target /mnt/evidence_mount --case unit5_dir
 USAGE
 }
@@ -73,6 +78,7 @@ USAGE
 # Args
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --project-root) PROJECT_ROOT="${2:-}"; shift 2;;
     --target) TARGET="${2:-}"; shift 2;;
     --out) OUTROOT="${2:-}"; shift 2;;
     --case) CASE_NAME="${2:-}"; shift 2;;
@@ -81,6 +87,7 @@ while [[ $# -gt 0 ]]; do
     --recover) RECOVER_MODE="${2:-}"; shift 2;;
     --max-recover) MAX_RECOVER="${2:-}"; shift 2;;
     --strings-cap-bytes) STR_CAP="${2:-}"; shift 2;;
+    --make-readonly) MAKE_READONLY=1; shift;;
     --yara) RUN_YARA=1; YARA_RULES="${2:-}"; shift 2;;
     --clamav) RUN_CLAMAV=1; shift;;
     -h|--help) usage; exit 0;;
@@ -91,6 +98,14 @@ done
 [[ -n "$TARGET" ]] || { usage; die "--target is required"; }
 [[ -e "$TARGET" ]] || die "Target not found: $TARGET"
 [[ "$RECOVER_MODE" =~ ^(interesting|all|none)$ ]] || die "--recover must be interesting|all|none"
+
+# If project-root is provided, create Unit5-style folders and default output location.
+if [[ -n "$PROJECT_ROOT" ]]; then
+  mkdir -p "$PROJECT_ROOT"/{evidence,hashes,notes,recovered,screenshots,tools}
+  if [[ "$OUTROOT" == "./output" ]]; then
+    OUTROOT="$PROJECT_ROOT/notes"
+  fi
+fi
 
 TS="$(date +"%Y%m%d_%H%M%S")"
 RUN_DIR="${OUTROOT%/}/${CASE_NAME}_run_${TS}"
@@ -164,9 +179,12 @@ banner "Environment snapshot"
   echo "Target: $TARGET"
   echo "Tools:"
   for t in sha256sum md5sum file strings mmls fsstat fls icat unzip zipinfo yara clamscan; do
-    if have "$t"; then echo "  - $t: $(command -v $t)"; else echo "  - $t: (missing)"; fi
+    if have "$t"; then echo "  - $t: $(command -v "$t")"; else echo "  - $t: (missing)"; fi
   done
 } | tee "$META_DIR/00_environment.txt" >/dev/null
+
+# Save file signature early (important when mmls fails on volume images)
+have file && file -s "$TARGET" | tee "$META_DIR/file_type.txt" >/dev/null || true
 
 banner "Hashing target"
 if [[ -f "$TARGET" ]]; then
@@ -182,12 +200,13 @@ fi
 
 MODE="dir"; [[ -f "$TARGET" ]] && MODE="image"
 
-# Auto offset helper
+# Auto offset helper (partitioned images). Returns nonzero if mmls fails (volume image).
 auto_offset(){
   local img="$1" out="$2"
   have mmls || die "mmls missing (install sleuthkit)"
-  mmls "$img" | tee "$out" >/dev/null
-  # heuristic: first line whose description mentions NTFS/Basic data/Microsoft
+  if ! mmls "$img" > "$out" 2>&1; then
+    return 1
+  fi
   awk 'BEGIN{off=""} /^[0-9]+/{desc=""; for(i=6;i<=NF;i++) desc=desc $i " "; if(off=="" && (desc~/(NTFS|Basic data|Microsoft)/i)) off=$3} END{print off}' "$out"
 }
 
@@ -195,12 +214,23 @@ if [[ "$MODE" == "image" ]]; then
   banner "Image mode (SleuthKit)"
   for t in fsstat fls icat; do have "$t" || die "$t missing (install sleuthkit)"; done
 
+  if [[ $MAKE_READONLY -eq 1 ]]; then
+    chmod a-w "$TARGET" 2>/dev/null || warn "Could not chmod a-w (permissions?)"
+  fi
+
+  # Offset detection:
+  # - Partitioned image: mmls works -> use detected offset
+  # - Volume image (like your NTFS volume): mmls fails -> use offset 0
   if [[ -z "$OFFSET_SECTORS" ]]; then
     banner "Detecting partition offset (sectors) via mmls"
-    OFFSET_SECTORS="$(auto_offset "$TARGET" "$META_DIR/mmls.txt")"
-    [[ -n "$OFFSET_SECTORS" ]] || { warn "Offset not detected; defaulting to 0 (better: pass --offset)"; OFFSET_SECTORS=0; }
+    if OFFSET_SECTORS="$(auto_offset "$TARGET" "$META_DIR/mmls.txt")"; then
+      [[ -n "$OFFSET_SECTORS" ]] || { warn "Offset not detected; defaulting to 0"; OFFSET_SECTORS=0; }
+    else
+      warn "mmls failed (likely volume image, no partition table). Using offset 0."
+      OFFSET_SECTORS=0
+    fi
   else
-    have mmls && mmls "$TARGET" | tee "$META_DIR/mmls.txt" >/dev/null || true
+    have mmls && mmls "$TARGET" > "$META_DIR/mmls.txt" 2>&1 || true
   fi
   info "Partition offset (sectors): $OFFSET_SECTORS"
 
@@ -232,7 +262,10 @@ if [[ "$MODE" == "image" ]]; then
     path="${line#*: }"; [[ "$path" == "$line" ]] && path="${line#*:}"; path="${path# }"
     echo "$inode|$path"
   }
-  is_file_line(){ [[ "$1" =~ ^r/ ]]; }
+
+  # Accept both: "r/r ..." and "-/r * ..."
+  is_file_line(){ [[ "$1" =~ ^(-/)?r/ ]]; }
+
   is_interesting(){ echo "$1" | grep -Eai "(\.(${EXT_FILTER})$|\.[a-z0-9]{1,5}\.(${EXT_FILTER})$)" >/dev/null; }
 
   recover_one(){
@@ -356,7 +389,10 @@ if [[ $RUN_YARA -eq 1 ]]; then
   banner "Optional: YARA"
   if have yara && [[ -d "$YARA_RULES" ]]; then
     yout="$ANA_DIR/yara_hits.txt"; : > "$yout"
-    while IFS= read -r f; do [[ -f "$f" ]] || continue; yara -r "$YARA_RULES" "$f" >> "$yout" 2>/dev/null || true; done < "$CANDS"
+    while IFS= read -r f; do
+      [[ -f "$f" ]] || continue
+      yara -r "$YARA_RULES" "$f" >> "$yout" 2>/dev/null || true
+    done < "$CANDS"
   else
     warn "yara missing or rules dir not found"
   fi
