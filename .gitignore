@@ -1,9 +1,29 @@
-output/
+cat > .gitignore << 'EOF'
+# Evidence / images / archives (never commit)
+*.E01
+*.e01
 *.dd
 *.img
-*.e01
-*.E01
-*.aff
 *.raw
+*.001
+*.zip
+*.7z
+*.rar
+*.iso
+
+# Generated artifacts / outputs
+artifacts/
+reports/
+output/
+runs/
+screenshots/
+*.log
+*.hash
+*.sha*
+*.md5
+*.txt
+
+# OS / editor
 .DS_Store
-Thumbs.db
+.vscode/
+EOF
