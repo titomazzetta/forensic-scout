@@ -6,14 +6,14 @@
 # Purpose:
 #   - Coursework/rubric-friendly, portfolio-ready CLI workflow.
 #   - Static-only analysis (no execution of recovered artifacts).
-#   - Image mode (NTFS) via SleuthKit OR directory mode (no deleted recovery).
-#   - Handles both partitioned images (mmls works) and volume images (mmls fails).
+#   - Disk image mode (NTFS) via SleuthKit OR directory mode (no deleted recovery).
 #
 # Debian/Kali installs:
 #   sudo apt install -y sleuthkit file binutils unzip
 # Optional (OFF by default):
 #   sudo apt install -y yara clamav
 # ==============================================================================
+
 set -euo pipefail
 
 BOLD="$(tput bold 2>/dev/null || true)"
@@ -29,8 +29,8 @@ TARGET=""
 OUTROOT="./output"
 PROJECT_ROOT=""
 CASE_NAME="case"
-OFFSET_SECTORS=""             # SleuthKit sector offset (partitioned images)
-RECOVER_MODE="interesting"     # interesting|all|none
+OFFSET_SECTORS=""             # SleuthKit sector offset
+RECOVER_MODE="interesting"    # interesting|all|none
 MAX_RECOVER=200
 STR_CAP=4000000
 KEYWORDS_FILE=""
@@ -52,7 +52,7 @@ Core:
   --target PATH            Disk image file OR mounted/extracted directory (required)
   --out DIR                Output root directory (default: ./output)
   --case NAME              Case label used in output folder (default: case)
-  --offset SECTORS         Partition offset in sectors (partitioned image mode); auto-detect if omitted
+  --offset SECTORS         Partition offset in sectors (image mode); auto-detect if omitted
   --keywords FILE          IOC keyword list (one per line); built-in list if omitted
 
 Recovery (image mode):
@@ -70,8 +70,7 @@ Static analysis:
 Examples:
   ./forensic_scout.sh --target evidence.dd --case unit5
   ./forensic_scout.sh --target evidence.dd --offset 2048 --case unit5
-  ./forensic_scout.sh --project-root ~/Documents/Unit5_Project_V2 --target ~/Documents/Unit5_Project_V2/evidence/fullstack_lab.img --case unit5 --make-readonly
-  ./forensic_scout.sh --target /mnt/evidence_mount --case unit5_dir
+  ./forensic_scout.sh --project-root ~/Documents/Unit5_Project --target ~/Documents/Unit5_Project/evidence/disk.img --case unit5 --make-readonly
 USAGE
 }
 
@@ -99,7 +98,6 @@ done
 [[ -e "$TARGET" ]] || die "Target not found: $TARGET"
 [[ "$RECOVER_MODE" =~ ^(interesting|all|none)$ ]] || die "--recover must be interesting|all|none"
 
-# If project-root is provided, create Unit5-style folders and default output location.
 if [[ -n "$PROJECT_ROOT" ]]; then
   mkdir -p "$PROJECT_ROOT"/{evidence,hashes,notes,recovered,screenshots,tools}
   if [[ "$OUTROOT" == "./output" ]]; then
@@ -124,6 +122,11 @@ exec > >(tee -a "$LOG") 2>&1
 banner "Forensic Scout starting"
 info "Run directory: $RUN_DIR"
 info "Target: $TARGET"
+
+# Save file signature early (useful when mmls fails on volume images)
+if [[ -f "$TARGET" ]] && have file; then
+  file -s "$TARGET" | tee "$META_DIR/file_type.txt" >/dev/null || true
+fi
 
 # Keywords
 BUILTIN_KW="$FLAG_DIR/ioc_keywords_builtin.txt"
@@ -179,12 +182,9 @@ banner "Environment snapshot"
   echo "Target: $TARGET"
   echo "Tools:"
   for t in sha256sum md5sum file strings mmls fsstat fls icat unzip zipinfo yara clamscan; do
-    if have "$t"; then echo "  - $t: $(command -v "$t")"; else echo "  - $t: (missing)"; fi
+    if have "$t"; then echo "  - $t: $(command -v $t)"; else echo "  - $t: (missing)"; fi
   done
 } | tee "$META_DIR/00_environment.txt" >/dev/null
-
-# Save file signature early (important when mmls fails on volume images)
-have file && file -s "$TARGET" | tee "$META_DIR/file_type.txt" >/dev/null || true
 
 banner "Hashing target"
 if [[ -f "$TARGET" ]]; then
@@ -200,7 +200,6 @@ fi
 
 MODE="dir"; [[ -f "$TARGET" ]] && MODE="image"
 
-# Auto offset helper (partitioned images). Returns nonzero if mmls fails (volume image).
 auto_offset(){
   local img="$1" out="$2"
   have mmls || die "mmls missing (install sleuthkit)"
@@ -218,9 +217,6 @@ if [[ "$MODE" == "image" ]]; then
     chmod a-w "$TARGET" 2>/dev/null || warn "Could not chmod a-w (permissions?)"
   fi
 
-  # Offset detection:
-  # - Partitioned image: mmls works -> use detected offset
-  # - Volume image (like your NTFS volume): mmls fails -> use offset 0
   if [[ -z "$OFFSET_SECTORS" ]]; then
     banner "Detecting partition offset (sectors) via mmls"
     if OFFSET_SECTORS="$(auto_offset "$TARGET" "$META_DIR/mmls.txt")"; then
@@ -230,7 +226,7 @@ if [[ "$MODE" == "image" ]]; then
       OFFSET_SECTORS=0
     fi
   else
-    have mmls && mmls "$TARGET" > "$META_DIR/mmls.txt" 2>&1 || true
+    have mmls && mmls "$TARGET" | tee "$META_DIR/mmls.txt" >/dev/null || true
   fi
   info "Partition offset (sectors): $OFFSET_SECTORS"
 
@@ -263,20 +259,28 @@ if [[ "$MODE" == "image" ]]; then
     echo "$inode|$path"
   }
 
-  # Accept both: "r/r ..." and "-/r * ..."
-  is_file_line(){ [[ "$1" =~ ^(-/)?r/ ]]; }
+  # Robust: matches r/r ... and -/r * ...
+  is_file_line(){
+    local t
+    t="$(echo "$1" | awk '{print $1}')"
+    [[ "$t" == */r ]]
+  }
 
   is_interesting(){ echo "$1" | grep -Eai "(\.(${EXT_FILTER})$|\.[a-z0-9]{1,5}\.(${EXT_FILTER})$)" >/dev/null; }
 
+  REC_ATTEMPTS=0
+  REC_SUCCESS=0
+
   recover_one(){
     local inode="$1" path="$2"
-    local safe
+    local safe out
     safe="$(echo "$path" | sed 's#^/##' | tr '/\\\n\r\t' '____' | tr -cd '[:alnum:]._-')"
     [[ -n "$safe" ]] || safe="inode_${inode}"
-    local out="$REC_DIR/deleted/${inode}__${safe}"
+    out="$REC_DIR/deleted/${inode}__${safe}"
     [[ -f "$out" ]] && return 0
     if icat -o "$OFFSET_SECTORS" "$TARGET" "$inode" > "$out" 2>/dev/null; then
       echo "$inode,$path,$out" >> "$REC_DIR/deleted_manifest.csv"
+      REC_SUCCESS=$((REC_SUCCESS+1))
     else
       rm -f "$out" 2>/dev/null || true
       echo "$inode,$path,(recover_failed)" >> "$REC_DIR/deleted_manifest_failed.csv"
@@ -286,17 +290,17 @@ if [[ "$MODE" == "image" ]]; then
   if [[ "$RECOVER_MODE" == "none" ]]; then
     warn "Skipping recovery"
   else
-    n=0
     while IFS= read -r line; do
       is_file_line "$line" || continue
       rec="$(parse_inode_path "$line")"
       inode="${rec%%|*}"; path="${rec#*|}"
       if [[ "$RECOVER_MODE" == "interesting" ]]; then is_interesting "$path" || continue; fi
       recover_one "$inode" "$path"
-      n=$((n+1))
-      [[ $n -lt $MAX_RECOVER ]] || { warn "Reached cap ($MAX_RECOVER)"; break; }
+      REC_ATTEMPTS=$((REC_ATTEMPTS+1))
+      [[ $REC_ATTEMPTS -lt $MAX_RECOVER ]] || { warn "Reached cap ($MAX_RECOVER)"; break; }
     done < "$LIST_DIR/fls_deleted.txt"
-    info "Recovered attempts: $n"
+    info "Recovered attempts: $REC_ATTEMPTS"
+    info "Recovered success:  $REC_SUCCESS"
   fi
 
 else
@@ -365,7 +369,6 @@ while IFS= read -r f; do
       cp -n "$f" "$FLAG_DIR/potential_malware/" 2>/dev/null || true
     fi
   fi
-
 done < "$CANDS"
 
 banner "ZIP inventory"
